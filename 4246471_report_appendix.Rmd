@@ -1,0 +1,1909 @@
+---
+title: "Predictive Analytics for Customer Retention at Stream-It"
+subtitle: "Project Appendix"
+author: "Sreyams Sathyan"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    reference_docx: STA739proj-template.docx
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(moments)
+library(summarytools)
+library(patchwork)
+library(rms)
+library(questionr)
+
+options(scipen=999)
+```
+
+# Appendix A: Data structure
+
+This appendix contains the full background process for the analysis of this project.  
+
+The aim of this project is to analyse a 12-month cohort of 400 subscribers to identify behavioral drivers of churn (cancellation) at Stream-It. We are required to transition from raw multivariate data to a validated survival model.
+A unique simulated data set will be used for analysis. The data set contains the following variables: 
+•	age: the age of the subscriber in years.
+•	income: the annual income of the subscriber (in thousands of Rand, e.g., 550 = R550,000).
+•	daily_mins: average minutes spent watching content per day.
+•	monthly_logins: average frequency of platform logins per month.
+•	variety_score: diversity of genres consumed, scaled 0–10.
+•	savings_ratio: subscription cost relative to the user’s monthly entertainment budget.
+•	time: months until the user cancelled or the study ended (max 12).
+•	status: 1 if the user cancelled; 0 if they remained subscribed (censored).
+
+The following code is used to generate the data and save it as a csv file to the device.
+```{r Data Simulation}
+# Replace '12345678' with your student number
+student_number <- 4246471 
+set.seed(student_number)
+
+library(MASS)
+n_users <- 400
+
+# 1. Generate multivariate data
+## Means: age(35), income(550kR), daily_mins(45), monthly_logins(20), variety(5), savings(0.15)
+mu_vec <- c(35, 550, 45, 20, 5, 0.15) 
+
+## Covariance structure (calibrated for South African professional context)
+sigma_mat <- matrix(c(
+  100,   120,  -5,   2,   1,  -0.02, # age
+  120, 15000,   5,   1,   2,  -0.05, # income
+   -5,     5, 100,  15,   2,  -0.03, # daily_mins
+    2,     1,  15,  25,   1,  -0.01, # monthly_logins
+    1,     2,   2,   1,   2,   0.01, # variety_score
+-0.02, -0.05, -0.03, -0.01, 0.01, 0.01  # savings_ratio
+), nrow = 6)
+
+vars <- mvrnorm(n_users, mu = mu_vec, Sigma = sigma_mat)
+colnames(vars) <- c("age", "income", "daily_mins", "monthly_logins", "variety_score", "savings_ratio")
+
+# Logical constraints: Ensure age and income remain within realistic bounds
+vars[,1] <- pmax(vars[,1], 18)
+vars[,2] <- pmax(vars[,2], 120) 
+
+# 2. Inject anomalies
+## Extreme outliers in daily_mins (simulating bot activity/errors)
+vars[sample(1:n_users, 8), 3] <- vars[sample(1:n_users, 8), 3] * 5  
+## Missing values in income (simulating non-response)
+vars[sample(1:n_users, 20), 2] <- NA                               
+
+# 3. Simulate 12-Month churn time (survival response)
+## betas determine the impact of each variable on the hazard of churn
+betas <- c(0.02, -0.002, -0.04, -0.02, -0.3, 2.5) 
+vars_clean <- vars; vars_clean[is.na(vars_clean)] <- 550 
+risk_val <- exp(vars_clean %*% betas) 
+t_churn <- rexp(n_users, rate = 0.015 * risk_val)
+
+# 4. Final dataset construction
+stream_data <- data.frame(
+  time = pmin(t_churn, 12), 
+  status = as.numeric(t_churn <= 12), 
+  vars
+)
+
+# Preliminary check
+# head(stream_data)
+# summary(stream_data$income)
+# 
+# #verify that data is correct 
+# table_status <- table(stream_data$status)
+# names(table_status) <- c("No Churn", "Churn")
+# table_status
+# 
+# library(ggplot2)
+# 
+# ggplot(stream_data, aes(x = factor(status))) +
+#   geom_bar(fill = "steelblue") +
+#   scale_x_discrete(labels = c("No Churn", "Churn")) +
+#   labs(
+#     title = "Distribution of Churn Status",
+#     x = "Status",
+#     y = "Count"
+#   ) +
+#   theme_minimal()
+# # save dataset to device
+# setwd("C:\\Users\\Administrator\\Desktop\\STA 739")
+# write.csv(stream_data, "StreamData.csv", row.names = FALSE)
+```
+## Appendix A1: Univariate EDA
+import the simulated dataset from the device and review the data, dimensions, structure and variables:
+```{r Import Data}
+# load relevant libraries
+library(tidyverse)
+library(skimr)
+library(GGally)
+library(survival)
+# CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org")) # Does not automatically choose CRAN mirror for some reason, so I specifically direct it to the nearest CRAN
+install.packages("visdat")
+library(visdat) # using this only for missing data visualisation
+library(knitr)
+library(kableExtra)
+options(scipen=999)
+# import data
+data <- read.csv("C:\\Users\\Administrator\\Desktop\\STA 739\\StreamData.csv") # this ensures that the same data set is used throughout the project
+data(head)  # preview data
+```
+This code below assesses the dimension of the database:
+```{r Dimensions}
+dim(data)   # 400 rows and 8 columns
+str(data)   # only integers and numeric variables
+names(data) # time, status, age, income, daily_mins, monthly_logins, variety_score and savings_ratio
+#unique(data) # produces too much output (400 observations are unique), so suppressed this line
+```
+
+Initial Unvariate EDA on raw data
+```{r Initial Unvariate EDA}
+# summary statistics
+summary(data)
+
+# missing data -> income should have 20
+colSums(is.na(data))
+
+# Percentage missing -> 5% is missing in income
+sapply(data, function(x) mean(is.na(x)) * 100)
+
+# Missing data visualisation - got this idea from DeepSeek, but this requires a package we have not used in notes
+vis_miss(data)
+
+## Summary of numeric statistics
+mins <- apply(data, 2, min)
+avgs <- apply(data, 2, mean)
+meds <- apply(data, 2, median)
+varbs <- apply(data, 2, var)
+sds <- apply(data, 2, sd)
+maxs <- apply(data, 2, max)
+skews <- apply(data, 2, skewness)
+kurts <- apply(data, 2, kurtosis)
+
+out <- matrix(c(mins,avgs,meds,varbs,sds,maxs,skews,kurts), nrow=8, ncol=ncol(data), byrow=TRUE)
+row.names(out) <- c("Min","Mean","Median","Variance","Std Dev","Max","Skewness","Kurtosis")
+colnames(out) <- names(data)
+knitr::kable(out)
+```
+Note: Income column shows 'NA' as there are missing observations.  
+Visualise Univariate EDA for raw data using the following code:
+```{r Univariate Visual EDA}
+#Univariate Visual EDA
+## Histograms for each variable using raw data
+hist(data$time, xlab="Time", main="Time distribution")
+hist(data$income, xlab="Income", main="Income distribution")
+hist(data$age, xlab="Age", main="Age distribution")
+hist(data$daily_mins, xlab="Daily Minutes", main="Daily Minutes distribution")
+hist(data$monthly_logins, xlab="Monthly Logins", main="Monthly Logins distribution")
+hist(data$variety_score, xlab="Variety Score", main="Variety Score distribution")
+hist(data$savings_ratio, xlab="Savings Ratio", main="Savings Ratio distribution")
+
+## Box plots for each predictor variable
+boxplot(data$age, horizontal=TRUE, main="Boxplot of Age")
+boxplot(data$time, horizontal=TRUE, main="Boxplot of Time")
+boxplot(data$income, horizontal=TRUE, main="Boxplot of Income")
+boxplot(data$daily_mins, horizontal=TRUE, main="Boxplot of Daily Minutes")
+boxplot(data$monthly_logins, horizontal=TRUE, main="Boxplot of Monthly Logins")
+boxplot(data$variety_score, horizontal=TRUE, main="Boxplot of Variety Score")
+boxplot(data$savings_ratio, horizontal=TRUE, main="Boxplot of Savings Ratio")
+```
+Now for covariance:  
+```{r Covariance}
+# using formula
+x <- data$age
+y <- data$income
+sam_n <- nrow(data)
+
+xbar <- mean(x)
+ybar <- mean(y)
+
+xy <- x * y
+
+s_xy <- (sum(xy) - sam_n * xbar * ybar) / (sam_n - 1)
+round(s_xy, 2)
+
+# using cov()
+s_xy <- cov(x, y)
+round(s_xy, 2)
+
+# covariance matrix by hand
+S <- matrix(0, nrow = 2, ncol = 2)
+rownames(S) <- colnames(S) <- c("age", "income")
+
+for(i in 1:2) {
+  for(j in 1:2) {
+    S[i, j] <- sum((data[, i] - mean(data[, i])) * 
+                   (data[, j] - mean(data[, j]))) / (nrow(data) - 1)
+  }
+}
+
+round(S, 2)
+
+# using cov()
+round(cov(data[, c("age", "income")]), 2) # NA because of missing observations
+```
+Then for correlation:  
+```{r Correlation}
+# using formula
+x <- data$age
+y <- data$income
+
+s_x <- sd(x)
+s_y <- sd(y)
+
+s_xy <- cov(x = x, y = y)
+
+r_xy <- s_xy / (s_x * s_y)
+round(r_xy, 3)
+
+## Using cor()
+r_xy <- cor(x = x, y = y)
+round(r_xy, 3)
+
+# Correlation matrix by hand
+R <- matrix(0, nrow = 2, ncol = 2)
+rownames(R) <- colnames(R) <- c("age", "income")
+
+for(i in 1:2) {
+  for(j in 1:2) {
+    R[i, j] <- sum((data[, i] - mean(data[, i])) * 
+                   (data[, j] - mean(data[, j]))) / 
+               (sqrt(sum((data[, i] - mean(data[, i]))^2)) * 
+                sqrt(sum((data[, j] - mean(data[, j]))^2)))
+  }
+}
+
+round(R, 2)
+
+# using cor() - income seems to decrease as age increases
+round(cor(data[, c("age", "income")]), 2)
+```
+## Appendix A2: Bivariate EDA
+Code for building and displaying scatter plots:
+```{r Scatter Plots}
+# Age and Income
+plot(x = data$age, y = data$income, 
+     xlab = "Age", ylab = "Income", 
+     pch = 21, bg = "black", 
+     main = "Age versus Income")
+abline(lm(data$income ~ data$age), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = age, y = income)) + 
+  geom_point() + 
+  ggtitle("Age versus Income") + 
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Age and Daily Minutes
+plot(x = data$age, y = data$daily_mins, 
+     xlab = "Age", ylab = "Daily Minutes", 
+     pch = 21, bg = "black", 
+     main = "Age versus Daily Minutes")
+abline(lm(data$daily_mins ~ data$age), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = age, y = daily_mins)) + 
+  geom_point() + 
+  ggtitle("Age versus Daily Minutes") + 
+  xlab("Age") + ylab("Daily Minutes") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Age and Monthly Logins
+plot(x = data$age, y = data$monthly_logins, 
+     xlab = "Age", ylab = "Monthly Logins", 
+     pch = 21, bg = "black", 
+     main = "Age versus Monthly Logins")
+abline(lm(data$monthly_logins ~ data$age), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = age, y = monthly_logins)) + 
+  geom_point() + 
+  ggtitle("Age versus Monthly Logins") + 
+  xlab("Age") + ylab("Monthly Logins") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Age and Variety Score
+plot(x = data$age, y = data$variety_score, 
+     xlab = "Age", ylab = "Variety Score", 
+     pch = 21, bg = "black", 
+     main = "Age versus Variety Score")
+abline(lm(data$variety_score ~ data$age), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = age, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Age versus Variety Score") + 
+  xlab("Age") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Age and Savings Ratio
+plot(x = data$age, y = data$savings_ratio, 
+     xlab = "Age", ylab = "Savings Ratio", 
+     pch = 21, bg = "black", 
+     main = "Age versus Savings Ratio")
+abline(lm(data$savings_ratio ~ data$age), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = age, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Age versus Savings Ratio") + 
+  xlab("Age") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Income and Daily Minutes
+plot(x = data$income, y = data$daily_mins, 
+     xlab = "Income", ylab = "Daily Minutes", 
+     pch = 21, bg = "black", 
+     main = "Income versus Daily Minutes")
+abline(lm(data$daily_mins ~ data$income), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = income, y = daily_mins)) + 
+  geom_point() + 
+  ggtitle("Income versus Daily Minutes") + 
+  xlab("Income") + ylab("Daily Minutes") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Income and Monthly Logins
+plot(x = data$income, y = data$monthly_logins, 
+     xlab = "Income", ylab = "Monthly Logins", 
+     pch = 21, bg = "black", 
+     main = "Income versus Monthly Logins")
+abline(lm(data$monthly_logins ~ data$income), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = income, y = monthly_logins)) + 
+  geom_point() + 
+  ggtitle("Income versus Monthly Logins") + 
+  xlab("Income") + ylab("Monthly Logins") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Income and Variety Score
+plot(x = data$income, y = data$variety_score, 
+     xlab = "Income", ylab = "Variety Score", 
+     pch = 21, bg = "black", 
+     main = "Income versus Variety Score")
+abline(lm(data$variety_score ~ data$income), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = income, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Income versus Variety Score") + 
+  xlab("Income") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Income and Savings Ratio
+plot(x = data$income, y = data$savings_ratio, 
+     xlab = "Income", ylab = "Savings Ratio", 
+     pch = 21, bg = "black", 
+     main = "Income versus Savings Ratio")
+abline(lm(data$savings_ratio ~ data$income), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = income, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Income versus Savings Ratio") + 
+  xlab("Income") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Daily Minutes and Monthly Logins
+plot(x = data$daily_mins, y = data$monthly_logins, 
+     xlab = "Daily Minutes", ylab = "Monthly Logins", 
+     pch = 21, bg = "black", 
+     main = "Daily Minutes versus Monthly Logins")
+abline(lm(data$monthly_logins ~ data$daily_mins), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = daily_mins, y = monthly_logins)) + 
+  geom_point() + 
+  ggtitle("Daily Minutes versus Monthly Logins") + 
+  xlab("Daily Minutes") + ylab("Monthly Logins") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Daily Minutes and Variety Score
+plot(x = data$daily_mins, y = data$variety_score, 
+     xlab = "Daily Minutes", ylab = "Variety Score", 
+     pch = 21, bg = "black", 
+     main = "Daily Minutes versus Variety Score")
+abline(lm(data$variety_score ~ data$daily_mins), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = daily_mins, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Daily Minutes versus Variety Score") + 
+  xlab("Daily Minutes") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Daily Minutes and Savings Ratio
+plot(x = data$daily_mins, y = data$savings_ratio, 
+     xlab = "Daily Minutes", ylab = "Savings Ratio", 
+     pch = 21, bg = "black", 
+     main = "Daily Minutes versus Savings Ratio")
+abline(lm(data$savings_ratio ~ data$daily_mins), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = daily_mins, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Daily Minutes versus Savings Ratio") + 
+  xlab("Daily Minutes") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Monthly Logins and Variety Score
+plot(x = data$monthly_logins, y = data$variety_score, 
+     xlab = "Monthly Logins", ylab = "Variety Score", 
+     pch = 21, bg = "black", 
+     main = "Monthly Logins versus Variety Score")
+abline(lm(data$variety_score ~ data$monthly_logins), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = monthly_logins, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Monthly Logins versus Variety Score") + 
+  xlab("Monthly Logins") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Monthly Logins and Savings Ratio
+plot(x = data$monthly_logins, y = data$savings_ratio, 
+     xlab = "Monthly Logins", ylab = "Savings Ratio", 
+     pch = 21, bg = "black", 
+     main = "Monthly Logins versus Savings Ratio")
+abline(lm(data$savings_ratio ~ data$monthly_logins), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = monthly_logins, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Monthly Logins versus Savings Ratio") + 
+  xlab("Monthly Logins") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+
+
+# Variety Score and Savings Ratio
+plot(x = data$variety_score, y = data$savings_ratio, 
+     xlab = "Variety Score", ylab = "Savings Ratio", 
+     pch = 21, bg = "black", 
+     main = "Variety Score versus Savings Ratio")
+abline(lm(data$savings_ratio ~ data$variety_score), 
+       col = "red", lty = "dashed", lwd = 2)
+
+data %>% 
+  ggplot(aes(x = variety_score, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Variety Score versus Savings Ratio") + 
+  xlab("Variety Score") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+```
+
+```{r Spearman Rank Correlation}
+# Using age and daily_mins 
+age_daily <- data[, c("age", "daily_mins")]
+
+age_daily %>% 
+  ggplot(aes(x = age, y = daily_mins)) + 
+  geom_point() + 
+  ggtitle("Age versus Daily Minutes") + 
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(age_daily$age, age_daily$daily_mins, method = "pearson")
+r_s <- cor(age_daily$age, age_daily$daily_mins, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Age and Income
+age_income <- data[, c("age", "income")]
+age_income %>% 
+  ggplot(aes(x = age, y = income)) + 
+  geom_point() + 
+  ggtitle("Age versus Income") + 
+  xlab("Age") + ylab("Income") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(age_income$age, age_income$income, method = "pearson")
+r_s <- cor(age_income$age, age_income$income, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Age and Monthly Logins
+age_logins <- data[, c("age", "monthly_logins")]
+age_logins %>% 
+  ggplot(aes(x = age, y = monthly_logins)) + 
+  geom_point() + 
+  ggtitle("Age versus Monthly Logins") + 
+  xlab("Age") + ylab("Monthly Logins") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(age_logins$age, age_logins$monthly_logins, method = "pearson")
+r_s <- cor(age_logins$age, age_logins$monthly_logins, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Age and Variety Score
+age_variety <- data[, c("age", "variety_score")]
+age_variety %>% 
+  ggplot(aes(x = age, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Age versus Variety Score") + 
+  xlab("Age") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(age_variety$age, age_variety$variety_score, method = "pearson")
+r_s <- cor(age_variety$age, age_variety$variety_score, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Age and Savings Ratio
+age_savings <- data[, c("age", "savings_ratio")]
+age_savings %>% 
+  ggplot(aes(x = age, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Age versus Savings Ratio") + 
+  xlab("Age") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(age_savings$age, age_savings$savings_ratio, method = "pearson")
+r_s <- cor(age_savings$age, age_savings$savings_ratio, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Income and Daily Minutes
+income_daily <- data[, c("income", "daily_mins")]
+income_daily %>% 
+  ggplot(aes(x = income, y = daily_mins)) + 
+  geom_point() + 
+  ggtitle("Income versus Daily Minutes") + 
+  xlab("Income") + ylab("Daily Minutes") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(income_daily$income, income_daily$daily_mins, method = "pearson")
+r_s <- cor(income_daily$income, income_daily$daily_mins, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Income and Monthly Logins
+income_logins <- data[, c("income", "monthly_logins")]
+income_logins %>% 
+  ggplot(aes(x = income, y = monthly_logins)) + 
+  geom_point() + 
+  ggtitle("Income versus Monthly Logins") + 
+  xlab("Income") + ylab("Monthly Logins") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(income_logins$income, income_logins$monthly_logins, method = "pearson")
+r_s <- cor(income_logins$income, income_logins$monthly_logins, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Income and Variety Score
+income_variety <- data[, c("income", "variety_score")]
+income_variety %>% 
+  ggplot(aes(x = income, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Income versus Variety Score") + 
+  xlab("Income") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(income_variety$income, income_variety$variety_score, method = "pearson")
+r_s <- cor(income_variety$income, income_variety$variety_score, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Income and Savings Ratio
+income_savings <- data[, c("income", "savings_ratio")]
+income_savings %>% 
+  ggplot(aes(x = income, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Income versus Savings Ratio") + 
+  xlab("Income") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(income_savings$income, income_savings$savings_ratio, method = "pearson")
+r_s <- cor(income_savings$income, income_savings$savings_ratio, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Daily Minutes and Monthly Logins
+daily_logins <- data[, c("daily_mins", "monthly_logins")]
+daily_logins %>% 
+  ggplot(aes(x = daily_mins, y = monthly_logins)) + 
+  geom_point() + 
+  ggtitle("Daily Minutes versus Monthly Logins") + 
+  xlab("Daily Minutes") + ylab("Monthly Logins") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(daily_logins$daily_mins, daily_logins$monthly_logins, method = "pearson")
+r_s <- cor(daily_logins$daily_mins, daily_logins$monthly_logins, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Daily Minutes and Variety Score
+daily_variety <- data[, c("daily_mins", "variety_score")]
+daily_variety %>% 
+  ggplot(aes(x = daily_mins, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Daily Minutes versus Variety Score") + 
+  xlab("Daily Minutes") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(daily_variety$daily_mins, daily_variety$variety_score, method = "pearson")
+r_s <- cor(daily_variety$daily_mins, daily_variety$variety_score, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Daily Minutes and Savings Ratio
+daily_savings <- data[, c("daily_mins", "savings_ratio")]
+daily_savings %>% 
+  ggplot(aes(x = daily_mins, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Daily Minutes versus Savings Ratio") + 
+  xlab("Daily Minutes") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(daily_savings$daily_mins, daily_savings$savings_ratio, method = "pearson")
+r_s <- cor(daily_savings$daily_mins, daily_savings$savings_ratio, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Monthly Logins and Variety Score
+logins_variety <- data[, c("monthly_logins", "variety_score")]
+logins_variety %>% 
+  ggplot(aes(x = monthly_logins, y = variety_score)) + 
+  geom_point() + 
+  ggtitle("Monthly Logins versus Variety Score") + 
+  xlab("Monthly Logins") + ylab("Variety Score") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(logins_variety$monthly_logins, logins_variety$variety_score, method = "pearson")
+r_s <- cor(logins_variety$monthly_logins, logins_variety$variety_score, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Monthly Logins and Savings Ratio
+logins_savings <- data[, c("monthly_logins", "savings_ratio")]
+logins_savings %>% 
+  ggplot(aes(x = monthly_logins, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Monthly Logins versus Savings Ratio") + 
+  xlab("Monthly Logins") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(logins_savings$monthly_logins, logins_savings$savings_ratio, method = "pearson")
+r_s <- cor(logins_savings$monthly_logins, logins_savings$savings_ratio, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+
+# Variety Score and Savings Ratio
+variety_savings <- data[, c("variety_score", "savings_ratio")]
+variety_savings %>% 
+  ggplot(aes(x = variety_score, y = savings_ratio)) + 
+  geom_point() + 
+  ggtitle("Variety Score versus Savings Ratio") + 
+  xlab("Variety Score") + ylab("Savings Ratio") +
+  geom_smooth(method = lm, se = FALSE, col = "red", lty = "dashed", lwd = 1)
+r_xy <- cor(variety_savings$variety_score, variety_savings$savings_ratio, method = "pearson")
+r_s <- cor(variety_savings$variety_score, variety_savings$savings_ratio, method = "spearman")
+out <- matrix(c(r_xy, r_s), nrow = 1, byrow = FALSE)
+row.names(out) <- "Correlation"
+colnames(out) <- c("Pearson", "Spearman")
+knitr::kable(out)
+```
+Now for the Mean Vector:
+```{r Mean Vector}
+# Select numeric variables for mean vector calculation
+Y_dat <- data[, c("age", "income", "daily_mins", "monthly_logins", "variety_score", "savings_ratio")]
+head(Y_dat)
+dim(Y_dat)
+str(Y_dat)
+
+## Using vector of ones (1) - income still NA
+vecj <- rep(1, nrow(Y_dat))
+dim(vecj) <- c(nrow(Y_dat), 1)
+
+Y <- as.matrix(Y_dat)
+
+ybar <- (t(vecj) %*% Y) / (nrow(Y_dat))
+round(ybar, 2)
+
+row.names(ybar) <- "Mean"
+knitr::kable(ybar)
+
+## Using vector of ones (2) - income still NA
+vecj <- rep(1, nrow(Y_dat))
+dim(vecj) <- c(nrow(Y_dat), 1)
+
+Y <- as.matrix(Y_dat)
+
+ybar <- (t(Y) %*% vecj) / (nrow(Y_dat))
+round(ybar, 2)
+
+colnames(ybar) <- "Mean"
+knitr::kable(ybar)
+## Using colMeans
+Y <- Y_dat
+ybar <- round(colMeans(Y), 2)
+ybar
+
+## Using apply()
+ybar <- apply(Y, 2, mean)
+ybar <- round(ybar, 2)
+ybar
+```
+Bivariate EDA for raw data and Visualisation 
+```{r Bivariate EDA: Visualisation}
+# scatter plots and Pearson + Spearman Coefficients
+# select all the numeric variables
+numeric_vars <- data %>%
+  dplyr::select(age,
+         time,
+         income,
+         daily_mins,
+         monthly_logins,
+         variety_score,
+         savings_ratio)
+
+# pearson correlation matrix
+pearson_corr <- cor(
+  numeric_vars,
+  use = "pairwise.complete.obs",
+  method = "pearson"
+)
+
+round(pearson_corr, 2)
+
+# spearman correlation matrix
+spearman_corr <- cor(
+  numeric_vars,
+  use = "pairwise.complete.obs",
+  method = "spearman"
+)
+
+round(spearman_corr, 2)
+
+#----------------- Scatter Plots with Correlations -------------------#
+# Used ChatGPT to repeat the same code with different variable names and headings
+# income vs daily_mins
+
+# Pearson correlation
+pearson_test1 <- cor.test(
+  data$income,
+  data$daily_mins,
+  method = "pearson",
+  use = "complete.obs"
+)
+
+# Spearman correlation
+spearman_test1 <- cor.test(
+  data$income,
+  data$daily_mins,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+# Print results
+pearson_test1
+spearman_test1
+
+# Scatter plot between income & daily_mins
+ggplot(data,
+       aes(x = income,
+           y = daily_mins)) +
+  geom_point(color = "steelblue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+
+  labs(title = "Income vs Daily Viewing Minutes",csubtitle = paste0("Pearson r = ", round(pearson_test1$estimate, 2), " | Spearman rho = ", round(spearman_test1$estimate, 2)), 
+       x = "Income (R'000)",
+    y = "Daily Minutes"
+  ) +
+
+  theme_minimal()
+# Scatter plot between age & income
+ggplot(data,
+       aes(x = age,
+           y = income)) +
+  geom_point(color = "steelblue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+
+  labs(title = "Age vs Income",csubtitle = paste0("Pearson r = ", round(pearson_test1$estimate, 2), " | Spearman rho = ", round(spearman_test1$estimate, 2)), 
+       x = "Age",
+    y = "Income (R'000)"
+  ) +
+
+  theme_minimal()
+# Scatter plot between time & monthly_logins
+ggplot(data,
+       aes(x = time,
+           y = monthly_logins)) +
+  geom_point(color = "steelblue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+
+  labs(title = "Time vs Monthly Logins",csubtitle = paste0("Pearson r = ", round(pearson_test1$estimate, 2), " | Spearman rho = ", round(spearman_test1$estimate, 2)), 
+       x = "Time (months until user cancelled)",
+    y = "Monthly Logins"
+  ) +
+
+  theme_minimal()
+# Scatter plot between daily_mins & variety_score
+ggplot(data,
+       aes(x = daily_mins,
+           y = variety_score)) +
+  geom_point(color = "steelblue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+
+  labs(title = "Daily Viewing Minutes vs Variety Score",csubtitle = paste0("Pearson r = ", round(pearson_test1$estimate, 2), " | Spearman rho = ", round(spearman_test1$estimate, 2)), 
+       x = "Daily Viewing Minutes",
+    y = "Variety Score"
+  ) +
+
+  theme_minimal()
+# Scatter plot between age & variety_score
+ggplot(data,
+       aes(x = age,
+           y = variety_score)) +
+  geom_point(color = "steelblue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+
+  labs(title = "Age vs Variety Score",csubtitle = paste0("Pearson r = ", round(pearson_test1$estimate, 2), " | Spearman rho = ", round(spearman_test1$estimate, 2)), 
+       x = "Age",
+    y = "Variety Score"
+  ) +
+
+  theme_minimal()
+# Scatter plot between age & savings_ratio
+ggplot(data, aes(x = age, y = savings_ratio)) +
+  geom_point(color = "steelblue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "Age vs Savings Ratio",csubtitle = paste0("Pearson r = ", round(pearson_test1$estimate, 2), " | Spearman rho = ", round(spearman_test1$estimate, 2)), x = "Age", y = "Savings Ratio") + theme_minimal()
+
+# pairwise scatterplot matrix
+ggpairs(numeric_vars, title = "Scatterplot Matrix of Predictor Variables")
+```
+Multivariate EDA and Visualisation for raw dataset
+```{r Correlation Heatmap}
+# Install and load the package the corrplot package
+install.packages("corrplot")
+library(corrplot)
+
+# correlation matrix
+cor_matrix <- cor(data)
+
+# basic heatmap on raw dataset
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45) # Rotate labels 45 degrees
+```
+The output shows question marks for the income variable as it is the only variable in the data set that contains missing variables and this does not allow R to compute its correlation with other variables. This is a big problem and needs to be taken care of through imputation. We can drop the 20 missing variables, however since there are only 400 observations, dropping any observation would mean losing valuable information. Thus, imputing the missing variables is the best option. Imputing blindly is also not a good idea, as we first need to deduce that if the missing variables are MAR, MCAR or MNAR. This will be finalized at a later stage, we now establish the target market for Stream-It. 
+
+## Appendix A3: Observations after Initial Inspection
+The EDA revealed many interesting patterns, even showing that savings ratio, variety score, monthly logins and income follow an approximately normal distribution. It also shows that majority of Stream-It's subscribers are middle-aged people. The correlation between variables are not very high, which could mean that multicollinearity may not be an issue in this study. 
+
+This dataset describes a realistic churn risk scenario through survival modelling — does not necessarily create perfectly separated customer groups. So the absence of dramatic correlations is expected. There are also no strong visible clusters. This is interesting as now we are more concerned about subtle behavioural effects, survival probabilities over time, and Hazard ratios from the Cox model. The EDA actually exposes important characteristics in the data.
+
+From the scatterplot matrix we can see that most correlations are very weak (close to 0). Only a few small positive relationships exist: monthly_logins vs variety_score; daily_mins vs monthly_logins and time vs daily_mins. None of them are strong enough to suggest redundancy. This is an excellent observation for the Cox model, as the predictors are not highly collinear and each variable may provide crucial information about churn risk. Thus, it is statistically reasonable to say that all predictors may contribute independently to churn. 
+
+A reasonable hypothesis would be that users with high engagement stay subscribed, while users with low engagement cancel their subscriptions. However, although the data set only contains 400 observations - the survival process is random and creates a realistic scenario of why users cancel their subscriptions. In real subscription business heavy users still churn, wealthy users still cancel and loyal users still leave. Therefore, churn is not caused by one factor. Possible reasons that may not be captured in this data may include: content fatigue, price increases, "The Hopper" mentality - some users subscribe for a month or two to binge a specific, highly anticipated show. Other reasons could include technical issues such as app performance and account-sharing restrictions. Excessive advertisements in basic tiers prompt users to cancel or upgrade to more expensive options. These factors are way survival modelling exists and provides a more accurate depiction rather than providing an inaccurate probability. 
+
+The likely target market for Stream-It based on EDA (using approximate centres):
+```{r Tarket Market, echo=FALSE}
+library(knitr)
+
+# Create dataframe
+df <- data.frame(
+  Variable = c("Age", "Income", "Daily Minutes", "Monthly Logins", "Variety Score"),
+  Approximate_Centre = c(35, "R550k", 45, 20, 5)
+)
+
+# Generate basic table
+kable(df)
+
+```
+The subscriber base consists primarily of working middle-aged adults with moderate-to-high streaming engagement behaviours. Average income levels mean that Stream-It primarily targets middle-income users capable of sustaining a reasonable savings ratio for digital entertainment spending. Therefore, Stream-It's target market is middle-income, working-age adults with moderate-to-high digital engagement.  
+
+One predictor is not solely responsible for churn, since people from all ages are unsubscribing. The scatterplot matrix shows almost no relationship between age and time/status and age correlations are near zero. So age alone may not be a primary determinant of subscription retention.
+
+The real reasons for customer churn could potentially be between user behaviour and the financial trade-off. Thus, the variables that will matter in the Cox model are Variety Score, Savings Ratio, Monthly Logins and Daily Minutes.
+Variety Score - broader content consumption generally improves retention, but does not guarantee loyalty.
+Savings Ratio - This is actually one of the strongest variables in the dataset. Because someone can earn high income, but still feel that the subscription is poor value. This variable will be able to capture price sensitivity, perceived affordability and entertainment prioritisation. 
+Monthly Logins & Daily Minutes - These are engagement metrics and we know by now that engagement does not always mean that users will not cancel their subscription. For example, someone who finished their favourite show could cancel if there are no more new episodes. So the model does not become invalid if high-viewing users churn.
+
+So in conclusion: Users churn across various demographic groups, which implies that a user cancelling their subscription is likely influenced by a combination of behavioural and financial factors rather than a single variable influencing users to churn. The Cox model may reveal significant effects that are not visually obvious in EDA.
+
+# Introduction and Problem Description
+Survival Modelling is used to analyse a 12-month cohort of 400 subscribers for Stream-It, a Video-on-Demand (VOD) platform. Rather than merely specifying if a subscriber will churn, specific modelling tools will be used to estimate when users churn and why they churn. It is often quite tricky to predict the reason for a user cancelling their subscription, so behavioural effects are studied to identify survival probabilities over time. Building a simple regression model to predict if a user will churn does not provide enough information to make an informed decision. By tracking time-to-event data for this cohort - Stream-It will be able to maximise an individual user's subscription revenue. By identifying trends and peaks of churn, Stream-It's executive team can introduce various strategies to improve subscriber retention. The goal is to find out when and why users cancel their subscriptions, then creating a solution to keep them engaged with Stream-It. The report is structured as follows: a methodology will provide logical transitions from raw data to the cleaned data by profiling anomalies. Then the data will be prepared for model development, this is then followed by an overview of the models and model validation. A results section then describe how to objectives are met and provide important results. Lastly, a Conclusion and recommendations section entails how Stream-It can apply the results to maximise subscriber retention. 
+
+```{r Customer Profiling}
+# this code is from ChatGPT ----------> Profiling the 400 subscribers
+# STRUCTURE SUBSCRIBERS BY CHURN STATUS
+
+# Goal:
+# Create a subscriber-level structure showing:
+# - who churned,
+# - who remained subscribed,
+# - survival time,
+# - censoring status,
+# - churn proportions,
+# - churn summaries by groups.
+
+library(tidyverse)
+
+
+# 1. CREATE HUMAN-READABLE CHURN LABELS
+
+stream_data <- data %>%
+  dplyr::mutate(
+    churn_status = ifelse(
+      status == 1,
+      "Cancelled",
+      "Active/Censored"
+    )
+  )
+
+# View first rows
+head(stream_data)
+
+# 2. TOTAL COUNTS OF SUBSCRIBERS
+
+table(stream_data$churn_status)
+
+# Percentages
+prop.table(table(stream_data$churn_status)) * 100
+
+# 3. BAR CHART OF CHURN STATUS
+
+ggplot(stream_data,
+       aes(x = churn_status,
+           fill = churn_status)) +
+
+  geom_bar() +
+
+  labs(
+    title = "Subscriber Churn Status Within 12 Months",
+    x = "Subscriber Status",
+    y = "Number of Subscribers"
+  ) +
+
+  theme_minimal()
+
+# 4. CREATE CHURN TIMELINE GROUPS
+
+stream_data <- stream_data %>%
+  mutate(
+    churn_period = case_when(
+      time <= 3 & status == 1 ~ "Early Churn (0-3 Months)",
+      time > 3 & time <= 6 & status == 1 ~ "Mid Churn (3-6 Months)",
+      time > 6 & time <= 12 & status == 1 ~ "Late Churn (6-12 Months)",
+      status == 0 ~ "Retained/Censored"
+    )
+  )
+
+# View counts
+table(stream_data$churn_period)
+
+# 5. VISUALIZE CHURN PERIODS
+
+ggplot(stream_data,
+       aes(x = churn_period,
+           fill = churn_period)) +
+
+  geom_bar() +
+
+  labs(
+    title = "Subscriber Retention Timeline",
+    x = "Retention Outcome",
+    y = "Number of Subscribers"
+  ) +
+
+  theme_minimal() +
+
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1)
+  )
+
+# 6. SURVIVAL TIME DISTRIBUTION
+
+ggplot(stream_data,
+       aes(x = time,
+           fill = churn_status)) +
+
+  geom_histogram(
+    bins = 20,
+    alpha = 0.7,
+    position = "identity"
+  ) +
+
+  labs(
+    title = "Distribution of Subscriber Survival Time",
+    x = "Months Until Cancellation/Censoring",
+    y = "Frequency"
+  ) +
+
+  theme_minimal()
+
+# 7. TABLE OF CHURNED VS RETAINED USERS
+
+subscriber_summary <- stream_data %>%
+  group_by(churn_status) %>%
+  summarise(
+    Subscribers = n(),
+    Mean_Age = round(mean(age, na.rm = TRUE), 1),
+    Mean_Income = round(mean(income, na.rm = TRUE), 1),
+    Mean_Daily_Mins = round(mean(daily_mins, na.rm = TRUE), 1),
+    Mean_Logins = round(mean(monthly_logins, na.rm = TRUE), 1),
+    Mean_Variety = round(mean(variety_score, na.rm = TRUE), 1),
+    Mean_Savings_Ratio = round(mean(savings_ratio, na.rm = TRUE), 2)
+  )
+
+subscriber_summary
+
+# 8. CREATE A SURVIVAL STATUS TABLE
+
+survival_status_table <- stream_data %>%
+  dplyr::select(
+    time,
+    status,
+    churn_status,
+    churn_period,
+    age,
+    income,
+    daily_mins,
+    monthly_logins,
+    variety_score,
+    savings_ratio
+  )
+
+head(survival_status_table)
+
+# 9. CENSORING RATE
+
+censoring_rate <- mean(stream_data$status == 0) * 100
+
+cat("Censoring Rate:",
+    round(censoring_rate, 2),
+    "%\n")
+
+# 10. CHURN RATE
+
+churn_rate <- mean(stream_data$status == 1) * 100
+
+cat("Churn Rate:",
+    round(churn_rate, 2),
+    "%\n")
+
+# INDIVIDUAL SUBSCRIBER STATUS VIEW
+
+stream_data %>%
+  dplyr::mutate(
+    subscriber_id = row_number()
+  ) %>%
+  dplyr::select(
+    subscriber_id,
+    time,
+    churn_status,
+    churn_period
+  ) %>%
+  head(10)
+```
+The above code categorises each observation into a specific churn period if the user cancelled their subscription. This is too much detail to add to the final report, however this characterises the data and adds a sense of realism for each observation. 
+
+# Appendix B: Data preparation for model development
+The exploratory data analysis revealed certain anomalies that need appropriate adjustments post-investigation before building any models. The cleaning procedure is documented here, and after accounting for each anomaly - the data is considered clean and ready for further model development.  
+The clearest anomaly is the missing values in the *income* variable, so there are 20 missing values -> 5% missingness. Ignoring these missing values would bias the survival model. Another major anomaly includes the extreme outliers in *daily_mins* the scatterplot matrix in univariate EDA shows a vertical cluster arounf normal viewing times. However, there were a few extremely high viewing times that do not depict realistic streaming behaviours. This could potentially be data capturing errors or automated streaming activity, either way it is unrealistic engagement and needs adjustments. The univariate EDA also shows a strong right skewness in *daily_mins* with the boxplot having along upper tail. This causes an inflated mean and the distributional assumptions may be affected. The concentration of observations at 12 months may seem to be a potential concern, however this is when the study period ends and those observations were users that did not cancel their subscriptions.
+A table summarising the anomalies is given below.
+```{r Anomaly Table, echo=FALSE}
+library(knitr)
+
+# Create dataframe
+df1 <- data.frame(
+  Variable = c("Income", "Daily Minutes", "Daily Minutes", "Time"),
+  Anomaly = c("Missing Values", "Extreme Outliers", "Right-Skewness", "Concentration at 12 months"),
+  Evidence = c("5% missing", "High daily viewing times", "Long upper tail", "Many censored observations"),
+  Possible_Cause = c("Non-response", "Data Errors", "Outlier Inflation", "End of Study")
+)
+
+# Generate basic table
+kable(df1)
+
+```
+## Appendix B1: Data Cleaning
+This code contains all data cleaning and data preparation procedures:
+```{r Reason for Missing Observations}
+# code is from NumericalAnalysisPart5
+options(scipen=999)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(mice)
+library(finalfit)
+
+# initial structure
+str(stream_data)
+summary(stream_data)
+
+# any missing values
+any(is.na(stream_data)) #TRUE
+# check missing values in every variable
+colSums(is.na(stream_data)) # only income -> 20
+
+# missing data pattern 
+md.pattern(stream_data) # shows if missing variables are churned users or not
+
+# missing value indicator for income
+# MCAR or MAR?
+income_mvi <- ifelse(is.na(stream_data$income), 0, 1)
+table(income_mvi) # shows that all missing variables are users that cancelled
+
+# !! check if missingness is related to other variables
+# t-test compare means
+aggregate(stream_data$age,
+          by = list(income_mvi),
+          FUN = mean)
+
+aggregate(stream_data$time,
+          by = list(income_mvi),
+          FUN = mean)
+
+aggregate(stream_data$daily_mins,
+          by = list(income_mvi),
+          FUN = mean)
+
+aggregate(stream_data$monthly_logins,
+          by = list(income_mvi),
+          FUN = mean)
+
+aggregate(stream_data$variety_score,
+          by = list(income_mvi),
+          FUN = mean)
+
+aggregate(stream_data$savings_ratio,
+          by = list(income_mvi),
+          FUN = mean)
+
+#t-tets: normality?
+library(ggpubr)
+ggqqplot(stream_data[is.na(stream_data$income), "time"]) + ggtitle("Q-Q plot of Income Non-responders")
+ggqqplot(stream_data[!is.na(stream_data$income), "time"]) + ggtitle("Q-Q plot of Income Responders") 
+
+# t-test: equal variances?
+var.test(stream_data$time ~ income_mvi) # Variances assumed equal
+
+#--------------------- Now we check if the missing income variables are related to any of the other variables -----------------#
+# Significant difference on time of cancellation?
+t.test(stream_data$time ~ income_mvi, var.equal = TRUE) # there is no difference between means of time and income
+kruskal.test(stream_data$time ~ income_mvi) # There is no statistically significant difference in the distribution of time across the different categories of income_mvi
+summary(aov(stream_data$time ~ income_mvi)) # ANOVA shows no statistically significant difference between the means of time across the categories of income_mvi
+#------------- The probability of income being missing does not depend on the observed values of time -----------#
+
+# Significant difference on age of subscriber?
+t.test(stream_data$age ~ income_mvi, var.equal = TRUE) # there is no difference between means of age and income
+kruskal.test(stream_data$age ~ income_mvi) # There is no statistically significant difference in the distribution of time across the different categories of income_mvi
+summary(aov(stream_data$age ~ income_mvi)) #ANOVA shows no statistically significant difference between the means of age across the categories of income_mvi
+#------------- The probability of income being missing does not depend on the observed values of age -----------#
+
+# Significant difference on daily viewing minutes?
+t.test(stream_data$daily_mins ~ income_mvi, var.equal = TRUE) # there is no difference between means of daily_mins and income
+kruskal.test(stream_data$daily_mins ~ income_mvi) # There is no statistically significant difference in the distribution of daily_mins across the different categories of income_mvi
+summary(aov(stream_data$daily_mins ~ income_mvi)) #ANOVA shows no statistically significant difference between the means of daily_mins across the categories of income_mvi
+#------------- The probability of income being missing does not depend on the observed values of daily_mins -----------#
+
+# Significant difference on monthly logins?
+t.test(stream_data$monthly_logins ~ income_mvi, var.equal = TRUE) # there is no difference between means of monthly_logins and income
+kruskal.test(stream_data$monthly_logins ~ income_mvi) # There is no statistically significant difference in the distribution of monthly logins across the different categories of income_mvi
+summary(aov(stream_data$monthly_logins ~ income_mvi)) #ANOVA shows no statistically significant difference between the means of monthly logins across the categories of income_mvi
+#------------- The probability of income being missing does not depend on the observed values of monthly logins-----------#
+
+# Significant difference on variety score?
+t.test(stream_data$variety_score ~ income_mvi, var.equal = TRUE) # there is no difference between means of variety score and income
+kruskal.test(stream_data$variety_score ~ income_mvi) # There is no statistically significant difference in the distribution of variety score across the different categories of income_mvi
+summary(aov(stream_data$variety_score ~ income_mvi)) #ANOVA shows no statistically significant difference between the means of variety score across the categories of income_mvi
+#------------- The probability of income being missing does not depend on the observed values of variety score-----------#
+
+# Significant difference on savings ratio?
+t.test(stream_data$savings_ratio ~ income_mvi, var.equal = TRUE) # there is no difference between means of variety score and savings ratio
+kruskal.test(stream_data$savings_ratio ~ income_mvi) # There is no statistically significant difference in the distribution of savings ratio across the different categories of income_mvi
+summary(aov(stream_data$savings_ratio ~ income_mvi)) #ANOVA shows no statistically significant difference between the means of savings ratio across the categories of income_mvi
+#------------- The probability of income being missing does not depend on the observed values of savings ratio -----------#
+#--------------------------------------------------------------- DONE ------------------------------------------------------------#
+```
+
+```{r Missing Imputation}
+## Missing_compare function
+library(finalfit)
+missing_compare(.data=stream_data, dependent="income", explanatory=c("age","time","daily_mins","monthly_logins", "savings_ratio", "variety_score"))
+
+# imputing based on other variables for each observation
+# Data extract for imputation demo
+stream_data_ext_dem <- stream_data[5:10, -c(5,6)]
+
+# missing compare function from mice package
+missing_compare(
+  .data = stream_data,
+  dependent = "income",
+  explanatory = c(
+    "age",
+    "time",
+    "daily_mins",
+    "monthly_logins",
+    "variety_score",
+    "savings_ratio"
+  )
+)
+
+#create clean copy
+stream_clean <- stream_data
+
+# make sure its correct
+head(stream_clean)
+
+# imputation using mice
+impute_data <- stream_clean %>%
+  dplyr::select(
+    income,
+    age,
+    daily_mins,
+    monthly_logins,
+    time,
+    variety_score,
+    savings_ratio
+  )
+
+# regression imputation
+imp_reg <- mice(
+  impute_data,
+  method = c(
+    "norm.predict", # income
+    "",             # age
+    "",             # daily_mins
+    "",             # monthly_logins
+    "",             # time
+    "",             # variety_score
+    ""              # savings_ratio
+  ),
+  m = 1,
+  maxit = 10,
+  printFlag = FALSE
+)
+
+# extract the imputed data in income
+imputed_values <- complete(imp_reg)
+# View imputed dataset
+head(imputed_values)
+
+# replace original income variable
+stream_clean$income <- imputed_values$income
+
+# verify one more time
+colSums(is.na(stream_clean)) # no more missing!!
+
+# compare before vs after imputation
+# BEFORE
+ggplot(stream_data,
+       aes(x = income)) + geom_histogram(bins = 25, fill = "red", color = "black" ) + labs(title = "Income Distribution Before Imputation") +
+theme_minimal()
+
+# AFTER
+ggplot(stream_clean,
+       aes(x = income)) + geom_histogram(bins = 25, fill = "green", color = "black" ) + labs(title = "Income Distribution After Imputation") +
+theme_minimal()
+
+# verify the observations that were imputed
+missing_income_rows <- which(is.na(stream_data$income))
+missing_income_rows # should have 20 observations
+
+# Compare original vs imputed - this can be added to a table
+data.frame(Row = missing_income_rows,
+  Original_Income = stream_data$income[
+    missing_income_rows],
+  Imputed_Income = stream_clean$income[
+    missing_income_rows])
+```
+
+```{r Outlier Adjustment}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(MASS)
+library(ggpubr)
+# boxplot to detect outliers once again - 9 dots
+ggplot(stream_data,
+       aes(y = daily_mins)) + geom_boxplot(fill = "tomato") +
+  labs(title = "Boxplot of Daily Viewing Minutes" ) + theme_minimal()
+
+# now to identify the extreme outliers using IQR
+Q1 <- quantile(stream_data$daily_mins,
+               0.25,
+               na.rm = TRUE)
+
+Q3 <- quantile(stream_data$daily_mins,
+               0.75,
+               na.rm = TRUE)
+
+IQR_val <- IQR(stream_data$daily_mins,
+               na.rm = TRUE)
+
+lower_bound <- Q1 - 1.5 * IQR_val
+upper_bound <- Q3 + 1.5 * IQR_val
+
+lower_bound
+upper_bound
+
+# Flag outliers
+daily_mins_outliers <- which(
+  stream_data$daily_mins < lower_bound |
+  stream_data$daily_mins > upper_bound
+)
+daily_mins_outliers # should have 9 outliers
+
+# View suspicious observations
+stream_data[daily_mins_outliers, ] # all 9 users cancelled
+
+# ---------------- Sorting out the Outliers ----------------#
+# first extract daily_mins
+x <- stream_data$daily_mins
+summary(x) # max variable is crazy
+
+# detect outliers using box plot rule
+# Quartiles
+Q1 <- quantile(x, 0.25, na.rm = TRUE)
+Q3 <- quantile(x, 0.75, na.rm = TRUE)
+
+# IQR
+IQR_val <- Q3 - Q1
+
+# lower and upper fences
+lf <- Q1 - 1.5 * IQR_val
+uf <- Q3 + 1.5 * IQR_val
+
+lf
+uf
+
+# check for outliers
+any(x < lf, na.rm = TRUE)
+any(x > uf, na.rm = TRUE) # so only very high is outliers
+
+# number of upper outliers
+sum(x > uf, na.rm = TRUE) # 9 outliers again
+
+# another boxplot just to make sure
+b <- boxplot(x, horizontal = TRUE, main = "Distribution of Daily Viewing Minutes")
+# Boxplot statistics
+b$stats
+# Outlier values
+b$out
+
+# qqplot (manual)
+x.s <- sort(x)
+
+# Remove NA values
+x.s <- x.s[!is.na(x.s)] # doesn't have any, but for clarity
+
+# Probability levels
+x.p <- (1:length(x.s) - 0.5) / length(x.s)
+
+# Store theoretical quantiles
+q.pop <- rep(0, length(x.s))
+
+# Detect duplicates
+x.sdup <- duplicated(x.s)
+
+for(i in 1:length(x.s))
+{
+  if(i > 1 & x.sdup[i] == TRUE)
+  {
+    q.pop[i-1] <- q.pop[i] <-
+      (qnorm(x.p[i-1]) + qnorm(x.p[i])) / 2
+  } else {
+    q.pop[i] <- qnorm(x.p[i])
+  }
+}
+
+# put everything together
+out <- matrix(
+  c(x.s, x.p, q.pop),
+  nrow = length(x.s),
+  ncol = 3,
+  byrow = FALSE
+)
+
+# label the columns
+colnames(out) <- c(
+  "Ordered obs",
+  "Prob levels",
+  "Std Normal quantiles"
+)
+# display the final table
+# knitr::kable(out) --- suppressed as output is too large
+
+# manual qqplot with headings
+plot(x = q.pop, y = x.s, main = "Manually Generated Q-Q Plot", xlab = "Theoretical Quantiles", ylab = "Sample Quantiles", pch = 21, bg = "black")
+
+# now built-in version 
+qqnorm(x, pch = 21, bg = "black", main = "R Generated Q-Q Plot")
+qqline(x)
+
+# now to sort out Z-scores to identify extreme outliers
+z <- (x - mean(x, na.rm = TRUE)) /
+      sd(x, na.rm = TRUE)
+
+# Extreme outliers?
+any(abs(z) > 3, na.rm = TRUE) # should say TRUE
+
+# Identify observations
+which(abs(z) > 3) # 7 extreme users
+
+# modified z-scores
+x_med <- median(x, na.rm = TRUE)
+
+x_MAD <- median(
+  abs(x - x_med),
+  na.rm = TRUE
+)
+
+zm <- (0.6745 * (x - x_med)) / x_MAD
+
+# Extreme outliers?
+any(abs(zm) > 3, na.rm = TRUE)
+
+# Outlier values
+x[which(abs(zm) > 3)] # this time all 9 users are shown, so stick to modified z-scores
+
+# Box-Cox Transformation for daily_mins
+bc <- boxcox(lm(x ~ 1))
+lambda <- bc$x[which.max(bc$y)]
+lambda
+
+# Interpretation of lambda
+if(lambda > 0.9 & lambda < 1.1) {
+  cat("No transformation required (lambda ≈ 1)\n")
+} else if(lambda > 0.4 & lambda < 0.6) {
+  cat("Square root transformation recommended (lambda ≈ 0.5)\n")
+} else if(lambda > -0.1 & lambda < 0.1) {
+  cat("Log transformation recommended (lambda ≈ 0)\n")
+} else if(lambda > -0.4 & lambda < -0.2) {
+  cat("Inverse square root transformation recommended (lambda ≈ -0.5)\n")
+} else {
+  cat("Power transformation with lambda =", round(lambda, 2), "recommended\n")
+}
+
+# Apply transformation
+x_transformed <- (x^lambda - 1) / lambda
+
+# Assess transformed data
+par(mfrow = c(1, 2))
+
+# Before transformation
+qqnorm(x, pch = 21, bg = "black", main = "Before Transformation")
+qqline(x, col = "red", lwd = 2)
+
+# After (nice equal tails)
+qqnorm(x_transformed, pch = 21, bg = "black", main = paste("After Box-Cox (λ =", round(lambda, 2), ")"))
+qqline(x_transformed, col = "red", lwd = 2)
+
+# Reset plotting layout
+par(mfrow = c(1,1))
+```
+```{r Outlier Adjustment Verification}
+# verify one last time in usual way, make sure max is lower
+summary(stream_clean$daily_mins)
+
+# any other outliers (it better be 0)
+sum(stream_clean$daily_mins > uf)
+
+# summary(stream_clean) - all good
+```
+Alright, so for the missing variables in *income*; there were 20 missing observations. Rather than simply imputing them with the median for *income*, all the other predictors were tested with *income* to identify any significant relationships. If there were any potential relationships with the other predictors, then that would mean that another predictor had influence on a user's income being missing. 3 tests were done to make sure if this was true :the t-test, Kruskal-Wallis Test and ANOVA. All three tests revealed that none of the other six predictors had any influence on income being missing. Thus, the missing observations were missing completely at random (MCAR). So we could impute them with the median, but realistically this would still create slight bias as *income* is usually a crucial component in determining the lifestyle of an individual. Therefore, the six variables relationships, although insignificant, were used to impute the 20 missing observations. This creates a highly realistic scenario, which reduces bias and improves the quality of the overall model. 
+
+The outliers were slightly tricky as the values were highly unlikely, but z-scores did not capture all the outliers, hence the modified z-scores were used to capture the more intricate outliers. These outliers consist of users that engage with Stream-It's platform much more than the average user. The values are more likely present due to data entry errors rather than real depictions of daily viewing minutes. An analysis was done to scope out the lower and upper-end outliers. Upon receiving the results, it was clear that the outliers are all on the upper end. Q-Q plots that were manually encoded and using built-in Q-Q plot function illustrated that there was significant deviation from normality. Modified Z-scores confirmed these influential observations and proved that the outliers likely represent recording anomalies. Box-Cox was used to preserve the nature of the outliers while accomodating them for the data. Box-Cox converts these non-normal data into a more bell-shaped normal distribution to stabilise variance. Ultimately, none of the anomalies were dropped so sample size was preserved while reducing distortion.
+
+## Appendix B2: EDA on Clean Data
+
+Now that missing observations in income have been imputed and outliers in daily_mins have been transformed using Box-Cox transformation - we can view the changes using a revised EDA:
+```{r Revised EDA on Clean Data}
+library(corrplot)
+# we need to remove the new variables that were added
+# This will only drop columns that are present, silently ignore missing ones
+library(dplyr)
+stream_clean_revised <- stream_clean %>%
+  dplyr::select(-any_of(c("churn_status", "churn_period", "variety_group", "age_group")))
+
+# View revised structure
+str(stream_clean_revised)
+
+# save to device 
+# write.csv(stream_clean_revised, "StreamData_Clean_Revised.csv", row.names = FALSE)
+
+# check difference
+dim(stream_clean)
+dim(stream_clean_revised)
+
+#Revised Correlation Heatmap
+# correlation matrix
+cor_matrix_new <- cor(stream_clean_revised)
+
+# basic heatmap
+corrplot(cor_matrix_new, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45) # Rotate labels 45 degrees
+
+# select all the numeric variables
+numeric_vars_revised <- stream_clean_revised %>%
+  dplyr::select(age,
+         time,
+         income,
+         daily_mins,
+         monthly_logins,
+         variety_score,
+         savings_ratio)
+
+# pairwise scatterplot matrix on clean data
+ggpairs(numeric_vars_revised, title = "Scatterplot Matrix of Predictor Variables")
+```
+
+## Appendix B3: Survival Response and Censoring Rate
+We need to formally define the survival response ($T_i , \delta_i$) and summarise the censoring rate.  
+
+$T_i =$ survival time for subscriber $i$  
+$\delta_i=$ event indicator
+Where:  
+$\delta_i=1 \rightarrow$ subscriber cancelled (event occurred) 
+$\delta_i=0 \rightarrow$ subscriber remained subscribed until the end of study period (right-censored)  
+
+In this dataset, *time* is $T_i$ and *status* is $\delta_i$  
+The survival object is created as follows:
+```{r Survival Object}
+# Load survival package
+library(survival)
+
+# Create survival response
+surv_obj <- Surv(
+  time = stream_clean$time,
+  event = stream_clean$status
+)
+
+# View survival object
+head(surv_obj)
+```
+next, the censoring rate - censoring in this case: subscribers who DID NOT churn within 12 months. status = 0 means censored and status = 1 means churned.
+censoring rate is as follows:
+```{r censoring Rate}
+# Censoring rate
+censoring_rate <- mean(stream_clean$status == 0) * 100
+censoring_rate
+```
+Churn rate is as follows:
+```{r Churn Rate}
+# Churn rate
+churn_rate <- mean(stream_clean$status == 1) * 100
+churn_rate
+```
+A frequency table for neat output:
+```{r Frequency Table}
+# Frequency table
+table(stream_clean$status)
+# Percentages
+prop.table(table(stream_clean$status)) * 100
+```
+A finalised summary table to include in report:
+```{r Summary Table}
+# Summary table
+survival_summary <- data.frame(
+  Outcome = c(
+    "Cancelled (Event)",
+    "Active (Censored)"
+  ),
+  Count = c(
+    sum(stream_clean$status == 1),
+    sum(stream_clean$status == 0)
+  ),
+  Percentage = c(
+    round(mean(stream_clean$status == 1) * 100, 2),
+    round(mean(stream_clean$status == 0) * 100, 2)
+  )
+)
+survival_summary
+```
+Bar chart of censoring vs Churn:
+```{r Bar chart of censoring vs Churn}
+stream_clean %>%
+  mutate(
+    status_label = ifelse(
+      status == 1,
+      "Cancelled",
+      "Active/Censored"
+    )
+  ) %>%
+  ggplot(aes(x = status_label,
+             fill = status_label)) + geom_bar() +
+  labs(
+    title = "Subscriber Outcomes Within 12 Months",
+    x = "Outcome",
+    y = "Number of Subscribers"
+  ) +
+  theme_minimal()
+```
+For report: The survival response is denoted as $(T_i, \delta_i)$, where $T_i$ represents the time in months until a subscriber cancels their subscription, and $\delta_i$ is the event indicator such that $\delta_i =1$ is the subscriber cancelled their subscription (event) and $\delta_i=0$ if the subscriber remained subscribed at the end of the 12-month study period. Active subscribers at month 12 are right-censored observations. The dataset contains administrative right censoring, with approximately 70.5% of subscribers remaining active at the end of the 12-month study period.
+
+# Appendix C: Model Deployment
+Now we can start building models. We start with the Kaplan-Meier Survival curve:
+```{r Kaplan-Meier Curve}
+# make sure we using the right data :)
+str(stream_clean)
+summary(stream_clean)
+
+# view survival object
+head(surv_obj)
+
+# fit Kaplan-Meier survival Curve
+fit_km <- survfit(surv_obj ~ 1, data = stream_clean)
+fit_km
+summary(fit_km)
+
+# plot Kaplan-Meier curve
+plot(fit_km, main = "Kaplan-Meier Survival Curve: Stream-It Subscribers", xlab = "Time (Months)", ylab = "Estimated Survival Probability", col = "blue", lwd = 2)
+abline(h = 0.5, col = "black",  lty = "dashed", lwd = 2)
+
+# summary of survival time
+summary(fit_km)$table 
+```
+Next for the hazard function:
+```{r Hazard Function}
+# Nelson-Aalen cumulative hazard function
+fit_na <- survfit(Surv(time, status) ~ 1, data = stream_clean, type = "fh")
+# Plot cumulative hazard
+plot(fit_na, fun = "cumhaz", main = "Nelson-Aalen Cumulative Hazard Function", xlab = "Time (Months)", ylab = "Cumulative Hazard", col = "red", lwd = 2)
+
+# Smoothed instantaneous hazard function
+library(muhaz)
+fit_hazard <- muhaz(
+  stream_clean$time,
+  stream_clean$status,
+  min.time = 0,
+  max.time = 12
+)
+# Plot hazard function
+plot(fit_hazard, main = "Smoothed Instantaneous Hazard Function", xlab = "Time (Months)", ylab = "Hazard Rate", col = "darkgreen", lwd = 2)
+```
+The increase in hazard rate from month 1 - 4 could possible indicate that users cancel subscriptions once they have finished watching their desired show or series. Once they have engaged with content that aligm with their interests (around 5 months), users tend to cancel their subscriptions at month 5.
+
+Now, we prepare for stratification:
+```{r Stratification}
+# for interpretability purpose users are split by High variety score and Low variety score
+median_variety <- median(stream_clean$variety_score)
+median_variety # so 5.104865 will be the threshold
+
+stream_clean$variety_group <- ifelse(
+  stream_clean$variety_score >= median_variety,
+  "High Variety",
+  "Low Variety"
+)
+table(stream_clean$variety_group) # interestingly, the data has been split 50/50
+```
+We are all set to build stratified models:
+```{r Stratified Models}
+# Stratified Kaplan-Meier Curves ---by variety score
+fit_group <- survfit(Surv(time, status) ~ variety_group, data = stream_clean)
+fit_group
+summary(fit_group)
+
+# plot stratified Kaplan-Meier Curves
+plot(fit_group, main = "Kaplan-Meier Survival Curve by Variety Group", ylab = "Estimated Survival Probability", xlab = "Time (Months)", col = c("blue", "red"), lwd = 2)
+legend("topright", c("High Variety", "Low Variety"), col = c("blue", "red"), lty = 1, lwd = 2)
+abline(
+  h = 0.5,
+  col = "black",
+  lty = "dashed",
+  lwd = 2
+)
+```
+We see that users with a Low Variety Score have a lower probability of staying subscribed towards the end of the study period, while users with a High Variety Score have a higher probability of staying subscribed.
+
+Now for the Log-Rank Test, since we have already stratified the data by Variety Score:
+```{r Log-Rank Test}
+# Log-Rank Test using Variety Score
+logrank_test <- survdiff(Surv(time, status) ~ variety_group, data = stream_clean)
+logrank_test
+
+# get the p-value
+pchisq(q = logrank_test$chisq, df = 1, lower.tail = FALSE) # less than 0.05!!
+
+# let's try splitting the data by age
+# median for age to split data
+median_age <- median(stream_clean$age)
+stream_clean$age_group <- ifelse(
+  stream_clean$age >= median_age,
+  "Older Subscribers",
+  "Younger Subscribers"
+)
+
+fit_age <- survfit(
+  Surv(time, status) ~ age_group,
+  data = stream_clean
+)
+
+# plot for age
+plot(fit_age, main = "Kaplan-Meier Curve by Age Group", ylab = "Estimated Survival Probability", xlab = "Time (Months)", col = c("purple", "orange"), lwd = 2)
+legend(
+  "topright",
+  c("Older Subscribers", "Younger Subscribers"),
+  col = c("purple", "orange"),
+  lty = 1,
+  lwd = 2
+)
+
+# Log-rank test using age
+logrank_age <- survdiff(
+  Surv(time, status) ~ age_group,
+  data = stream_clean
+)
+# p-value
+pchisq(q = logrank_age$chisq, df = 1, lower.tail = FALSE) # greater than 0.05, not a good split
+
+# Log-rank test using time
+logrank_time <- survdiff(
+  Surv(time, status) ~ time,
+  data = stream_clean
+)
+# p-value
+pchisq(q = logrank_time$chisq, df = 1, lower.tail = FALSE) # less than 0.05 = good split
+```
+Younger users have a greater probability of staying subscribed towards the end of the study period. 
+That is the end of the survival analysis.  
+Kaplan-Meier curve estimates subscriber retention over time.  
+Hazard function identifies periods of elevated churn risk.  
+Log-rank test compares survival experience between subscriber groups.  
+Significant p-values indicate different churn behaviour between groups.
+
+# Appendix D: Cox Proportional Hazard Model
+
+We now move to building a Cox Proportional Hazards model using the following code:  
+```{r Cox Proportional Hazards Model}
+options(scipen = 999)
+library(survival)
+
+# check data
+summary(stream_clean) # perfect
+
+# fit Cox Proportional Hazards Model
+stream_coxph <- coxph(Surv(time, status) ~
+    age +
+    income +
+    daily_mins +
+    monthly_logins +
+    variety_score +
+    savings_ratio,
+  data = stream_clean
+)
+
+# Model Summary
+stream_coxph_all <- summary(stream_coxph)
+stream_coxph_all
+
+# all components
+names(stream_coxph_all)
+# covariate significance
+stream_coxph_all$coefficients
+
+age_z <- stream_coxph_all$coefficients[1,1] / stream_coxph_all$coefficients[1,3]
+age_z
+
+# Two-sided p-value
+age_sig <- 2 * pnorm(age_z,lower.tail = FALSE)
+age_sig
+
+# Cox PH model: effect
+stream_coxph_all$coefficients
+
+age_hr <- stream_coxph_all$coefficients[1,2]
+age_hr
+
+## OR
+age_Bhat <- stream_coxph_all$coefficients[1,1]
+age_Bhat
+
+age_hr2 <- exp(age_Bhat)
+age_hr2
+
+# Confidence Interval
+stream_coxph_all$conf.int
+
+# Proportional Hazards Assumption
+stream_phtest <- cox.zph(stream_coxph)
+stream_phtest
+# Plot PH Assumption Test
+plot(stream_phtest)
+
+# ----- Interpretation ----- #
+# Null hypothesis:
+# Proportional hazards assumption holds
+
+# If p > 0.05:
+# PH assumption satisfied
+
+# If p < 0.05:
+# Potential PH violation
+
+# save clean data to device
+# setwd("C:\\Users\\Administrator\\Desktop\\STA 739")
+# write.csv(stream_clean, "StreamDataClean.csv", row.names = FALSE)
+```
+*summary(stream_coxph)* Shows that all three test statistics agree that the model is significant, since all three associated p-values are well below the default significance level of 0.05. Research has shown that the Likelihood ratio test is statistically more reliable than the other two tests so it is used to conclude the overall model significance (Kleinbaum & Klein, 2005).
+
+Bivariate Analysis should mention significant scores when discussing relevancy (relationship between target and predictors)
+
+Considering the coefficient output, it is evident that age, income, daily_mins, variety_score and saving_ratio are significant predictors (p-values < 0.05). Age and savings_ratio have positive coefficients, this means that both predictors are associated with an increase in the hazard rate. Meanwhile, income, daily_mins, and variety_score have negative coefficients, meaning these predictors are associated with a decrease in the hazard rate (Luus, 2026).  
+
+So now we interpret the confidence interval hazard ratios. Interpretation guide:  
+HR > 1 → increases churn risk (bad for retention)  
+HR < 1 → decreases churn risk (good for retention)  
+If 95% CI includes 1 → no significant difference  
+
+Age: HR = 1.019 (95% CI: 1.000 – 1.039)  
+Each additional year of age increases churn risk by approximately 1.9%.  
+The true effect could be as small as 0.019% or as large as 3.9%. Since the lower bound is almost exactly 1 - Older users have slightly higher churn risk, but this age has a small effect on users cancelling.  
+
+Income: HR = 0.998 (95% CI: 0.996 – 0.999)  
+Each R1,000 higher annual income reduces churn risk by approximately 0.2%.  
+Income has a small effect but this is reliable since confidence interval is entirely below 1. Higher-income users are slightly less likely to cancel their subscriptions.  
+
+Daily minutes watched: HR = 0.957 (95% CI: 0.939 – 0.974)  
+Each additional minute reduces churn risk by approximately 4.3%. Confidence interval is lower than 1. More engaged users are much less likely to unsubscribe.  
+
+Monthly Logins: HR = 0.992 (95% CI: 0.954 – 1.032)  
+Suggests approximately 0.8% lower churn risk per extra login, however confidence interval includes 1, so it is not statistically significant. Therefore, login frequency per month does not clearly predict churn.  
+
+Variety Score: HR = 0.833 (95% CI: 0.730 – 0.950)  
+Each +1 point on the 0–10 variety score reduces churn risk by approximately 16.7%. Confidence interval indicates that the reduction is between 5% and 27%. So users who explore more genres are significantly more loyal compared to users who do not explore many genres.  
+
+Savings Ratio: HR = 7.864 (95% CI: 1.192 – 51.866)  
+A one-unit increase in savings ratio multiplies churn risk by approximately 7.9 times. The confidence interval is very wide, which shows high uncertainty. Thus, when the subscription price is very high relative to the user's budget, the risk of cancelling their subscription increases tremendously. 
+
+Conclusion: Monthly logins has no effect on churn.  
+Savings ratio – consider budget/promo tiers.  
+Daily minutes & variety – increase engagement & content discovery.  
+Income – small effect, but premium features might help retention.  
+
+However, these findings from the Cox Proportional Hazard model can only be used if the assumptions of the model are validated. The model is based on the proportional hazards assumption. The next step would be to validate the proportional hazards assumption. 
+
+We will be using the goodness-of-fit test to assess the proportional hazard assumption. The goodness-of-fit is performed for each covariate separately.
+
+*stream_phtest* to view proportional hazards assumption. We have already stated that  the null hypothesis assumes the PH assumption is valid. For almost all the predictors (excluding monthly_logins) the p-values of their test statistics are more than the default significance level of 0.05 and as such the null hypothesis is not rejected. There is not sufficient evidence to conclude that the PH assumption does not hold for age, income, daily_mins, variety_score, and savings_ratio. Furthermore, GLOBAL (p = 0.098) concludes that PH assumption is valid for this model.
+
+*plot(stream_phtest)* shows the trajectories all close to the horizontal. For all predictors, except monthly_logins - the covariates are somewhat flat, so the PH assumption holds for all predictors other than monthly_logins. Notice how monthly_logins shows a slightly angled trajectory suggesting that this covariate does not hold the PH asumption. This violation of PH assumption for monthly_logins does not mean Cox regression cannot be used, this means that the model needs to be modified slightly to account for monthly_logins. 
